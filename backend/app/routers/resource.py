@@ -10,6 +10,7 @@ from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
 from app.services import SERVICE_INSTANCES, service_for
+from app.services import environment_engine as engine
 from app.store import store
 
 router = APIRouter(prefix="/api", tags=["业务资源"])
@@ -20,6 +21,262 @@ def require_service(module: str):
     if service is None:
         raise HTTPException(status_code=404, detail=f"未知业务模块：{module}")
     return service
+
+
+# ── 环境阈值与判定接口 ──
+# 路径使用 env-monitor 而不是模块 key env_monitor，避免和通用 /api/{module} 资源路由混淆。
+
+
+@router.get("/env-monitor/thresholds")
+def list_env_thresholds(area: str = Query(default="")) -> dict[str, Any]:
+    rows = engine.list_thresholds()
+    if area:
+        rows = [
+            row for row in rows
+            if engine.normalize_area(row.get("施工区域")) == engine.normalize_area(area)
+        ]
+    return {"items": rows, "total": len(rows)}
+
+
+@router.post("/env-monitor/thresholds")
+def set_env_threshold(payload: dict[str, Any]) -> dict[str, Any]:
+    area = str(payload.get("施工区域") or payload.get("area") or "").strip()
+    humidity = payload.get("湿度阈值", payload.get("humidity"))
+    try:
+        row = engine.set_threshold(
+            area,
+            humidity,
+            operator=str(payload.get("设定人") or payload.get("operator") or ""),
+            remark=str(payload.get("备注说明") or payload.get("remark") or ""),
+            auto_judge=bool(payload.get("auto_judge", True)),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    judgement = engine.latest_judgement(area)
+    return {"ok": True, "message": f"{area}湿度阈值已设为{row.get('湿度阈值')}%", "threshold": row,
+            "judgement": judgement}
+
+
+@router.get("/env-monitor/judgements")
+def list_env_judgements(area: str = Query(default="")) -> dict[str, Any]:
+    rows = [dict(row) for row in store.rows(engine.JUDGEMENT_MODULE)]
+    if area:
+        rows = [
+            row for row in rows
+            if engine.normalize_area(row.get("监测位置")) == engine.normalize_area(area)
+        ]
+    return {"items": rows, "total": len(rows)}
+
+
+@router.post("/env-monitor/judge")
+def judge_area(payload: dict[str, Any]) -> dict[str, Any]:
+    area = str(payload.get("施工区域") or payload.get("area") or "").strip()
+    if not area:
+        raise HTTPException(status_code=400, detail="施工区域不能为空")
+    judgement = engine.evaluate(area)
+    return {"ok": True, "message": f"{area}判定结果：{judgement.get('判定结果')}", "judgement": judgement}
+
+
+@router.get("/env-monitor/start-status")
+def env_start_status(
+    area: str = Query(default=""),
+    process: str = Query(default=""),
+) -> dict[str, Any]:
+    """开工请求与迟到的超限报告共用同一个核实入口。"""
+    return engine.start_status(area, process)
+
+
+@router.get("/env-monitor/resume")
+def env_resume_list(area: str = Query(default="")) -> dict[str, Any]:
+    rows = engine.list_resume(area or None)
+    return {"items": rows, "total": len(rows)}
+
+
+@router.post("/env-monitor/resume/{entry_id}/confirm")
+def env_resume_confirm(entry_id: int) -> dict[str, Any]:
+    row, message = engine.confirm_resume(entry_id)
+    return {"ok": row is not None, "message": message, "entry": row}
+
+
+@router.get("/env-monitor/permits")
+def env_permits(area: str = Query(default="")) -> dict[str, Any]:
+    rows = (
+        engine.permits_for_area(area) if area
+        else [dict(row) for row in store.rows(engine.PERMIT_MODULE)]
+    )
+    return {"items": rows, "total": len(rows)}
+
+
+# ── 跨模块联动查询 API ──
+
+@router.get("/cross-module/snapshot")
+def cross_module_snapshot(
+    modules: str = Query(default=""),
+) -> dict[str, Any]:
+    """返回多个模块的状态快照，供前端跨模块面板使用。"""
+    module_list = [m.strip() for m in modules.split(",") if m.strip()] if modules else []
+    if not module_list:
+        module_list = store.module_names()
+    return store.cross_module_snapshot(module_list)
+
+
+@router.get("/cross-module/dependent-status/{module}/{entry_id}")
+def get_dependent_status(module: str, entry_id: int) -> dict[str, Any]:
+    """获取指定条目的上下游跨模块依赖状态。"""
+    service = require_service(module)
+    entry = service.get_entry(entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"条目 {entry_id} 在 {module} 中不存在")
+
+    result: dict[str, Any] = {
+        "module": module,
+        "entry_id": entry_id,
+        "entry": entry,
+        "upstream": [],
+        "downstream": [],
+    }
+
+    # 按模块键建立跨模块查询规则
+    if module == "work_sequence":
+        process = entry.get("工序名称", "")
+        # 上游：前置工序、安全交底
+        prereq = entry.get("前置工序", "")
+        for ws in store.rows("work_sequence"):
+            if ws.get("工序名称", "") == prereq:
+                result["upstream"].append({"module": "work_sequence", "id": ws.get("id"),
+                    "name": ws.get("工序名称"), "status": ws.get("status")})
+        for safety in store.rows("safety_briefing"):
+            if safety.get("交底工序", "") == process:
+                result["upstream"].append({"module": "safety_briefing", "id": safety.get("id"),
+                    "name": safety.get("交底工序"), "status": safety.get("status")})
+        # 下游：质量检查、验收记录、排期
+        for qi in store.rows("quality_inspect"):
+            if qi.get("检查工序", "") == process:
+                result["downstream"].append({"module": "quality_inspect", "id": qi.get("id"),
+                    "name": qi.get("检查工序"), "status": qi.get("status")})
+        for ar in store.rows("acceptance_record"):
+            if ar.get("验收工序", "") == process:
+                result["downstream"].append({"module": "acceptance_record", "id": ar.get("id"),
+                    "name": ar.get("验收工序"), "status": ar.get("status")})
+        # 环境链路：本工序所在施工区域的判定、复工清单和开工许可
+        area = engine.normalize_area(entry.get("施工区域"))
+        if area:
+            judgement = engine.latest_judgement(area)
+            if judgement:
+                result["upstream"].append({
+                    "module": "env_judgement", "id": judgement.get("id"),
+                    "name": f"{area}环境判定", "status": judgement.get("判定结果"),
+                })
+            for resume in engine.list_resume(area):
+                if int(resume.get("关联工序ID", 0) or 0) == entry_id:
+                    result["downstream"].append({
+                        "module": "work_resume", "id": resume.get("id"),
+                        "name": resume.get("工序名称"), "status": resume.get("status"),
+                    })
+            for permit in engine.permits_for_area(area):
+                if int(permit.get("关联工序ID", 0) or 0) == entry_id:
+                    result["downstream"].append({
+                        "module": "work_permit", "id": permit.get("id"),
+                        "name": permit.get("许可编号"), "status": permit.get("status"),
+                    })
+    elif module == "env_monitor":
+        # 读数 -> 本区域判定、复工清单和开工许可
+        area = engine.normalize_area(entry.get("监测位置"))
+        if area:
+            judgement = engine.latest_judgement(area)
+            if judgement:
+                result["downstream"].append({
+                    "module": "env_judgement", "id": judgement.get("id"),
+                    "name": f"{area}环境判定", "status": judgement.get("判定结果"),
+                })
+            for resume in engine.list_resume(area):
+                result["downstream"].append({
+                    "module": "work_resume", "id": resume.get("id"),
+                    "name": resume.get("工序名称"), "status": resume.get("status"),
+                })
+            for permit in engine.permits_for_area(area):
+                result["downstream"].append({
+                    "module": "work_permit", "id": permit.get("id"),
+                    "name": permit.get("许可编号"), "status": permit.get("status"),
+                })
+    elif module == "quality_inspect":
+        process = entry.get("检查工序", "")
+        for ar in store.rows("acceptance_record"):
+            if ar.get("验收工序", "") == process:
+                result["downstream"].append({"module": "acceptance_record", "id": ar.get("id"),
+                    "name": ar.get("验收工序"), "status": ar.get("status")})
+    elif module == "change_order":
+        process = entry.get("影响工序", "")
+        for sched in store.rows("construction_schedule"):
+            if sched.get("计划工序", "") == process:
+                result["downstream"].append({"module": "construction_schedule", "id": sched.get("id"),
+                    "name": sched.get("计划工序"), "status": sched.get("status")})
+    elif module == "acceptance_record":
+        process = entry.get("验收工序", "")
+        for qi in store.rows("quality_inspect"):
+            if qi.get("检查工序", "") == process:
+                result["upstream"].append({"module": "quality_inspect", "id": qi.get("id"),
+                    "name": qi.get("检查工序"), "status": qi.get("status")})
+    elif module == "construction_schedule":
+        process = entry.get("计划工序", "")
+        for co in store.rows("change_order"):
+            if co.get("影响工序", "") == process:
+                result["upstream"].append({"module": "change_order", "id": co.get("id"),
+                    "name": co.get("变更事项"), "status": co.get("status")})
+
+    return result
+
+
+@router.get("/cross-module/dependency-graph")
+def dependency_graph() -> dict[str, Any]:
+    """返回跨模块依赖关系图。"""
+    graph: dict[str, Any] = {
+        "nodes": [],
+        "edges": [],
+    }
+    # 各模块依存关系
+    for mod_name in store.module_names():
+        service = SERVICE_INSTANCES.get(mod_name)
+        if service:
+            snapshot = service.domain_snapshot()
+            graph["nodes"].append({
+                "module": mod_name,
+                "entity": snapshot.get("entity", ""),
+                "count": snapshot.get("count", 0),
+                "abnormal": snapshot.get("abnormal", 0),
+                "by_status": snapshot.get("by_status", {}),
+            })
+
+    # 边：业务单据流转
+    graph["edges"] = [
+        {"from": "building_survey", "to": "restoration_plan", "label": "勘查输入方案"},
+        {"from": "restoration_plan", "to": "material_verify", "label": "方案工艺约束核验"},
+        {"from": "restoration_plan", "to": "expert_review", "label": "专家评审方案"},
+        {"from": "expert_review", "to": "restoration_plan", "label": "汇总意见通过方案"},
+        {"from": "restoration_plan", "to": "craftsman_assign", "label": "方案确定工匠"},
+        {"from": "safety_briefing", "to": "work_sequence", "label": "安全交底==发布前提"},
+        {"from": "safety_briefing", "to": "construction_schedule", "label": "安全交底==排期前提"},
+        {"from": "craftsman_assign", "to": "work_sequence", "label": "工匠到岗==施工前提"},
+        {"from": "work_sequence", "to": "construction_schedule", "label": "工序编排驱动排期"},
+        {"from": "work_sequence", "to": "quality_inspect", "label": "工序完成==质量检查"},
+        {"from": "quality_inspect", "to": "acceptance_record", "label": "检查通过触发验收"},
+        {"from": "acceptance_record", "to": "restoration_log", "label": "验收签署归档日志"},
+        {"from": "acceptance_record", "to": "work_sequence", "label": "验收签署完成工序"},
+        {"from": "acceptance_record", "to": "archive_mgmt", "label": "验收签署触发归档"},
+        {"from": "change_order", "to": "construction_schedule", "label": "变更签认影响排期"},
+        {"from": "change_order", "to": "funding_use", "label": "变更费用追加支出"},
+        {"from": "construction_schedule", "to": "completion_summary", "label": "全部排期完成==竣工"},
+        {"from": "material_verify", "to": "work_sequence", "label": "材料签认解锁工序"},
+        {"from": "restoration_log", "to": "work_sequence", "label": "全部日志归档==完成"},
+        {"from": "env_monitor", "to": "env_judgement", "label": "最近两次有效测量判定持续超限"},
+        {"from": "env_threshold", "to": "env_judgement", "label": "按施工区域湿度阈值约束"},
+        {"from": "env_judgement", "to": "work_resume", "label": "持续超限==停工待复工"},
+        {"from": "env_judgement", "to": "work_permit", "label": "持续超限==阻断开工许可"},
+        {"from": "work_resume", "to": "work_sequence", "label": "复工核实通过==恢复施工"},
+        {"from": "work_sequence", "to": "work_permit", "label": "开工核实==签发唯一许可"},
+
+    ]
+    return graph
 
 
 @router.get("/{module}", response_model=PageResult[dict])
@@ -99,126 +356,3 @@ def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResu
     return ActionResult(ok=entry is not None, message=message, entry=entry)
 
 
-# ── 跨模块联动查询 API ──
-
-@router.get("/cross-module/snapshot")
-def cross_module_snapshot(
-    modules: str = Query(default=""),
-) -> dict[str, Any]:
-    """返回多个模块的状态快照，供前端跨模块面板使用。"""
-    module_list = [m.strip() for m in modules.split(",") if m.strip()] if modules else []
-    if not module_list:
-        module_list = store.module_names()
-    return store.cross_module_snapshot(module_list)
-
-
-@router.get("/cross-module/dependent-status/{module}/{entry_id}")
-def get_dependent_status(module: str, entry_id: int) -> dict[str, Any]:
-    """获取指定条目的上下游跨模块依赖状态。"""
-    service = require_service(module)
-    entry = service.get_entry(entry_id)
-    if entry is None:
-        raise HTTPException(status_code=404, detail=f"条目 {entry_id} 在 {module} 中不存在")
-
-    result: dict[str, Any] = {
-        "module": module,
-        "entry_id": entry_id,
-        "entry": entry,
-        "upstream": [],
-        "downstream": [],
-    }
-
-    # 按模块键建立跨模块查询规则
-    if module == "work_sequence":
-        process = entry.get("工序名称", "")
-        # 上游：前置工序、安全交底
-        prereq = entry.get("前置工序", "")
-        for ws in store.rows("work_sequence"):
-            if ws.get("工序名称", "") == prereq:
-                result["upstream"].append({"module": "work_sequence", "id": ws.get("id"),
-                    "name": ws.get("工序名称"), "status": ws.get("status")})
-        for safety in store.rows("safety_briefing"):
-            if safety.get("交底工序", "") == process:
-                result["upstream"].append({"module": "safety_briefing", "id": safety.get("id"),
-                    "name": safety.get("交底工序"), "status": safety.get("status")})
-        # 下游：质量检查、验收记录、排期
-        for qi in store.rows("quality_inspect"):
-            if qi.get("检查工序", "") == process:
-                result["downstream"].append({"module": "quality_inspect", "id": qi.get("id"),
-                    "name": qi.get("检查工序"), "status": qi.get("status")})
-        for ar in store.rows("acceptance_record"):
-            if ar.get("验收工序", "") == process:
-                result["downstream"].append({"module": "acceptance_record", "id": ar.get("id"),
-                    "name": ar.get("验收工序"), "status": ar.get("status")})
-    elif module == "quality_inspect":
-        process = entry.get("检查工序", "")
-        for ar in store.rows("acceptance_record"):
-            if ar.get("验收工序", "") == process:
-                result["downstream"].append({"module": "acceptance_record", "id": ar.get("id"),
-                    "name": ar.get("验收工序"), "status": ar.get("status")})
-    elif module == "change_order":
-        process = entry.get("影响工序", "")
-        for sched in store.rows("construction_schedule"):
-            if sched.get("计划工序", "") == process:
-                result["downstream"].append({"module": "construction_schedule", "id": sched.get("id"),
-                    "name": sched.get("计划工序"), "status": sched.get("status")})
-    elif module == "acceptance_record":
-        process = entry.get("验收工序", "")
-        for qi in store.rows("quality_inspect"):
-            if qi.get("检查工序", "") == process:
-                result["upstream"].append({"module": "quality_inspect", "id": qi.get("id"),
-                    "name": qi.get("检查工序"), "status": qi.get("status")})
-    elif module == "construction_schedule":
-        process = entry.get("计划工序", "")
-        for co in store.rows("change_order"):
-            if co.get("影响工序", "") == process:
-                result["upstream"].append({"module": "change_order", "id": co.get("id"),
-                    "name": co.get("变更事项"), "status": co.get("status")})
-
-    return result
-
-
-@router.get("/cross-module/dependency-graph")
-def dependency_graph() -> dict[str, Any]:
-    """返回跨模块依赖关系图。"""
-    graph: dict[str, Any] = {
-        "nodes": [],
-        "edges": [],
-    }
-    # 各模块依存关系
-    for mod_name in store.module_names():
-        service = SERVICE_INSTANCES.get(mod_name)
-        if service:
-            snapshot = service.domain_snapshot()
-            graph["nodes"].append({
-                "module": mod_name,
-                "entity": snapshot.get("entity", ""),
-                "count": snapshot.get("count", 0),
-                "abnormal": snapshot.get("abnormal", 0),
-                "by_status": snapshot.get("by_status", {}),
-            })
-
-    # 边：业务单据流转
-    graph["edges"] = [
-        {"from": "building_survey", "to": "restoration_plan", "label": "勘查输入方案"},
-        {"from": "restoration_plan", "to": "material_verify", "label": "方案工艺约束核验"},
-        {"from": "restoration_plan", "to": "expert_review", "label": "专家评审方案"},
-        {"from": "expert_review", "to": "restoration_plan", "label": "汇总意见通过方案"},
-        {"from": "restoration_plan", "to": "craftsman_assign", "label": "方案确定工匠"},
-        {"from": "safety_briefing", "to": "work_sequence", "label": "安全交底==发布前提"},
-        {"from": "safety_briefing", "to": "construction_schedule", "label": "安全交底==排期前提"},
-        {"from": "craftsman_assign", "to": "work_sequence", "label": "工匠到岗==施工前提"},
-        {"from": "work_sequence", "to": "construction_schedule", "label": "工序编排驱动排期"},
-        {"from": "work_sequence", "to": "quality_inspect", "label": "工序完成==质量检查"},
-        {"from": "quality_inspect", "to": "acceptance_record", "label": "检查通过触发验收"},
-        {"from": "acceptance_record", "to": "restoration_log", "label": "验收签署归档日志"},
-        {"from": "acceptance_record", "to": "work_sequence", "label": "验收签署完成工序"},
-        {"from": "acceptance_record", "to": "archive_mgmt", "label": "验收签署触发归档"},
-        {"from": "change_order", "to": "construction_schedule", "label": "变更签认影响排期"},
-        {"from": "change_order", "to": "funding_use", "label": "变更费用追加支出"},
-        {"from": "construction_schedule", "to": "completion_summary", "label": "全部排期完成==竣工"},
-        {"from": "material_verify", "to": "work_sequence", "label": "材料签认解锁工序"},
-        {"from": "restoration_log", "to": "work_sequence", "label": "全部日志归档==完成"},
-
-    ]
-    return graph

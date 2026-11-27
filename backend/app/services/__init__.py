@@ -10,7 +10,13 @@ from app.services.work_sequence import WorkSequenceService
 from app.services.quality_inspect import QualityInspectService
 from app.services.historical_drawing import HistoricalDrawingService
 from app.services.component_registry import ComponentRegistryService
-from app.services.env_monitor import EnvMonitorService
+from app.services.env_monitor import (
+    EnvJudgementService,
+    EnvMonitorService,
+    EnvThresholdService,
+    WorkPermitService,
+    WorkResumeService,
+)
 from app.services.restoration_log import RestorationLogService
 from app.services.acceptance_record import AcceptanceRecordService
 from app.services.funding_use import FundingUseService
@@ -31,6 +37,10 @@ SERVICES: dict[str, BaseModuleService] = {
     "historical_drawing": HistoricalDrawingService(),
     "component_registry": ComponentRegistryService(),
     "env_monitor": EnvMonitorService(),
+    "env_threshold": EnvThresholdService(),
+    "env_judgement": EnvJudgementService(),
+    "work_resume": WorkResumeService(),
+    "work_permit": WorkPermitService(),
     "restoration_log": RestorationLogService(),
     "acceptance_record": AcceptanceRecordService(),
     "funding_use": FundingUseService(),

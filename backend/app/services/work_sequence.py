@@ -1,8 +1,13 @@
-"""工序编排领域服务：编排修缮工序顺序，发布工序时检查前置工序完成状态、安全交底和工匠到岗。"""
+"""工序编排领域服务：编排修缮工序顺序，发布工序时检查前置工序完成状态、安全交底和工匠到岗。
+
+开工（开始施工）还要经过施工区域的环境核实：同一区域按最近两次有效测量判定持续超限后，
+开工立即受阻；核实与签发开工许可在同一把区域锁内完成，并发请求只会得到一份有效许可。
+"""
 from __future__ import annotations
 
 from typing import Any
 
+from app.services import environment_engine as engine
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -16,6 +21,39 @@ class WorkSequenceService(BaseModuleService):
     STATUS_ORDER = ["待排期", "已发布", "施工中", "已完成"]
     ACTION_RULES = {"发布工序": "已发布", "开始施工": "施工中", "完成工序": "已完成"}
     NEGATIVE_ACTIONS = []
+
+    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+        """开工/复工相关动作按施工区域串行，避免与迟到的环境读数交错。"""
+        entry = store.find(self.MODULE, entry_id)
+        area = engine.normalize_area(entry.get("施工区域")) if entry else ""
+        if not area or action not in {"开始施工", "完成工序"}:
+            return super().run_action(entry_id, action)
+        try:
+            with engine.area_guard(area):
+                # 持有区域锁后先按最新读数重新判定，再做幂等、校验与状态变更。
+                if action == "开始施工" and engine.get_threshold(area) is not None:
+                    judgement = engine.evaluate(area)
+                    if judgement.get("是否报警") and entry is not None and entry.get("status") != "施工中":
+                        return None, (
+                            f"{area}环境持续超限，开工受阻：{judgement.get('判定说明', '')}"
+                        )
+                    if entry is not None and entry.get("status") == "已暂停" and not judgement.get("是否报警"):
+                        return self._restart_paused(entry)
+                return super().run_action(entry_id, action)
+        except engine.EnvironmentBusy as exc:
+            return None, str(exc)
+
+    def _restart_paused(self, entry: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+        """环境恢复后从已暂停重新开工：重新签发（或复用）开工许可并更新复工清单。"""
+        entry["status"] = "施工中"
+        entry["pending"] = False
+        entry["abnormal"] = False
+        entry["环境暂停"] = False
+        entry["环境阻断"] = False
+        entry["环境可复工"] = True
+        permit = engine.ensure_permit(entry)
+        engine.mark_resume_completed(entry)
+        return entry, f"工序「{entry.get('工序名称')}」环境核实通过，已重新开工（许可{permit.get('许可编号')}）"
 
     def cross_module_verify(
         self, entry_id: int, action: str, entry: dict[str, Any]
@@ -53,14 +91,42 @@ class WorkSequenceService(BaseModuleService):
                 unreleased = [s for s in schedules if s.get("status") == "编制中"]
                 if unreleased:
                     return False, "关联施工排期还未发布"
+            # 环境核实：本施工区域持续超限时开工受阻，其他区域不受影响。
+            area = engine.normalize_area(entry.get("施工区域"))
+            if area and engine.get_threshold(area) is not None:
+                judgement = engine.evaluate(area)
+                if judgement.get("是否报警"):
+                    return False, (
+                        f"{area}环境持续超限，开工受阻："
+                        f"{judgement.get('判定说明', '')}"
+                    )
         return True, ""
 
     def cross_module_effect(
         self, entry_id: int, action: str, entry: dict[str, Any]
     ) -> list[dict]:
         effects = []
+        if action == "发布工序":
+            # 发布时该区域已在持续超限：直接标出环境阻断，进入复工清单等环境恢复。
+            area = engine.normalize_area(entry.get("施工区域"))
+            if area and engine.get_threshold(area) is not None:
+                judgement = engine.evaluate(area)
+                if judgement.get("是否报警"):
+                    entry["环境阻断"] = True
+                    entry["停工原因"] = judgement.get("判定说明", "")
+                    engine.suspend_area(area, judgement)
+                    effects.extend(
+                        row for row in store.rows(engine.RESUME_MODULE)
+                        if engine.normalize_area(row.get("施工区域")) == area
+                    )
+        if action == "开始施工":
+            # 环境核实已通过，签发（或复用）本工序唯一一份有效开工许可。
+            permit = engine.ensure_permit(entry)
+            effects.append(permit)
+            engine.mark_resume_completed(entry)
         if action == "完成工序":
             process_name = entry.get("工序名称", "")
+            engine.mark_resume_completed(entry)
             # 工序完成后联动更新关联施工排期
             for sched in store.rows("construction_schedule"):
                 if sched.get("计划工序", "") == process_name:
@@ -85,4 +151,5 @@ class WorkSequenceService(BaseModuleService):
             for r in all_rows
         ]
         base["completed"] = [r.get("工序名称") for r in all_rows if r.get("status") == "已完成"]
+        base["resume_list"] = engine.list_resume()
         return base

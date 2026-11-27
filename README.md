@@ -59,6 +59,10 @@ npm run dev
 | 历史图纸 | `historical_drawing` | 历史图纸 | 图纸编号、绘制年代、绘制内容 |
 | 构件登记 | `component_registry` | 构件档案 | 构件名称、所属建筑、材质类型 |
 | 环境监测 | `env_monitor` | 监测数据 | 监测位置、温度读数、湿度读数 |
+| 环境阈值 | `env_threshold` | 湿度阈值 | 施工区域、湿度阈值 |
+| 环境判定 | `env_judgement` | 环境判定 | 监测位置、前一次/最近一次读数、判定结果 |
+| 工序复工 | `work_resume` | 复工条目 | 工序名称、停工原因、读数依据 |
+| 开工许可 | `work_permit` | 开工许可 | 许可编号、许可状态、关联判定 |
 | 修缮日志 | `restoration_log` | 施工日志 | 施工日期、对应工序、施工内容 |
 | 验收记录 | `acceptance_record` | 验收报告 | 验收工序、验收标准、验收结论 |
 | 修缮支出 | `funding_use` | 支出记录 | 支出项目、支出类别、预算金额 |
@@ -76,6 +80,19 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 环境阈值判定
+
+- 湿度阈值按施工区域分别设定，`POST /api/env-monitor/thresholds`，
+  `GET /api/env-monitor/thresholds?area=东廊`。
+- 同一位置只取最近两次有效测量判断持续超限，判定结果写入 `env_judgement`；
+  补录旧读数和缺测会显式标出，不参与“最近两次”的选取，也不能拿来提前复工。
+- 报警只作用于本施工区域：东廊超限不会影响西廊的施工和开工核实。
+- 开工请求与迟到的超限读数共用区域锁，双方都通过
+  `GET /api/env-monitor/start-status?area=东廊` 核实是否受阻、已受理工序是否要暂停；
+  同一工序并发开工只会保留一份有效 `work_permit`。
+- 复工入口：`GET /api/env-monitor/resume?area=东廊` 与
+  `POST /api/env-monitor/resume/{id}/confirm`。
 
 领域：应用开发
 子方向：web前端/全栈开发

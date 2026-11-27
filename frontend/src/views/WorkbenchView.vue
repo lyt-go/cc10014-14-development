@@ -28,6 +28,8 @@
       </span>
     </p>
 
+    <EnvConsole v-if="showEnvConsole" />
+
     <form class="filter-bar" @submit.prevent="reload">
       <label v-for="field in filterFields" :key="field" class="filter-item">
         <span>{{ field }}</span>
@@ -80,7 +82,11 @@
         <h3>登记{{ meta.entity }}</h3>
         <label v-for="field in meta.fields" :key="field" class="create-field">
           <span>{{ field }}</span>
-          <input v-model="createValues[field]" :data-testid="`create-${field}`" required />
+          <input
+            v-model="createValues[field]"
+            :data-testid="`create-${field}`"
+            :required="isRequired(field)"
+          />
         </label>
         <div class="page-actions">
           <button class="btn" type="button" @click="showCreate = false">取消</button>
@@ -107,6 +113,7 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import EnvConsole from '@/components/EnvConsole.vue'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
@@ -116,9 +123,14 @@ const total = ref(0)
 const errorMessage = ref('')
 const filters = ref<Record<string, string>>({})
 const filterFields = meta.fields.slice(0, 3)
+const showEnvConsole = ['env_monitor', 'env_threshold', 'env_judgement', 'work_resume', 'work_permit'].includes(meta.key)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+
+function isRequired(field: string): boolean {
+  return meta.requiredFields ? meta.requiredFields.includes(field) : true
+}
 
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
